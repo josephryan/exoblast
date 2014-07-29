@@ -1,0 +1,330 @@
+#!perl
+
+# CMD TO TEST WITH: 
+#   exoblast --query=exoblast_test_files/prots.fa \
+#   --assembly=exoblast_test_files/assembly1.fa \
+#   --assembly=exoblast_test_files/assembly2.fa --blast=tblastn
+#   --out=test.exoblast
+#
+# TEST TODO:
+#     confirm that the script DOES predict the best assembly
+#     the test set is weird since the first and second entry have
+#     a higher e-value but lower bit-score than the third and fourth
+#     row.  NOt sure if that is just a small sample or what
+
+# TODO:
+#      --min_contig_size=IGNORE_ASSEMBLED_SEQS_SHORTER_THAN_THIS
+
+use strict;
+use warnings;
+require 5.7.0;
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp qw/ tempfile tempdir /;
+use List::Util qw/ shuffle /;
+use JFR::Fasta;
+use Data::Dumper;
+
+our $VERSION = 0.06;
+our $AUTHOR  = 'Joseph F. Ryan <joseph.ryan@whitney.ufl.edu>';
+our $TBLASTN = 'tblastn';
+our $TBLASTX = 'tblastx';
+our $MAKEBLASTDB = 'makeblastdb';
+our $QUIET = 1;
+our $DEFAULT_EVAL = 0.001;
+our $DEFAULT_NUM_QUERIES = 5000;
+our $DEFAULT_THREADS = 1;
+
+MAIN: {
+    my $cmdline = join " ", $0, @ARGV;
+    my $rh_opts   = process_options();
+    make_blastdb($rh_opts) unless ($rh_opts->{'blastdb'});
+    make_query_subset($rh_opts);
+    my $bl        = run_blast($rh_opts);
+    my $rh_hits   = get_hits($bl);
+    my $rh_sc     = score_assemblies($rh_hits);
+    print_header($rh_opts,$cmdline);
+    foreach my $key (sort {$rh_sc->{$b} <=> $rh_sc->{$a}} keys %{$rh_sc}) {
+        print "$key\t$rh_sc->{$key}\n";
+    }
+}
+
+sub print_header {
+    my $rh_opts = shift;
+    my $cmdline = shift;
+    print "$0 version: $VERSION\n\n";
+    print "CMD-LINE: $cmdline\n\n";
+    print "random seed is $rh_opts->{'randomseed'}\n\n";
+    print "# Assembly\tNumber of Top Hits\n";
+}
+
+sub make_query_subset {
+    my $rh_opts = shift;
+    my $count = _get_count_of_seqs($rh_opts->{'query'});
+    $rh_opts->{'num_queries'} = $count if ($rh_opts->{'num_queries'} > $count);
+    my $fp = JFR::Fasta->new($rh_opts->{'query'});
+    my $rh_selection = _get_random_sequence_positions($count,$rh_opts);
+    my $num = 0;
+    my $fasta = '';
+    while (my $rec = $fp->get_record()) {
+        $num++;
+        next unless ($rh_selection->{$num});
+        $fasta .= "$rec->{'def'}\n$rec->{'seq'}\n";
+    }
+    my ($fh,$tmpfile) = tempfile( DIR => $rh_opts->{'dir'} );
+    print $fh $fasta;
+    $rh_opts->{'query'} = $tmpfile;
+}
+
+sub _get_random_sequence_positions {
+    my $count   = shift;
+    my $rh_opts = shift;
+    my %rands = ();
+    my @all = (1..$count);
+    my @shuf = @all[(shuffle(0..$#all))[0..($rh_opts->{'num_queries'} - 1)]];
+    foreach my $sh (@shuf) {
+        $rands{$sh}++;
+    }
+    return \%rands;
+}
+
+sub _get_count_of_seqs {
+    my $file = shift;
+    my $count = 0;
+    open IN, $file or die "cannot open $file:$!";
+    while (my $line = <IN>) {
+        $count++ if ($line =~ m/^>/);
+    }
+    close IN;
+    return $count;
+}
+
+sub score_assemblies {
+    my $rh_hits = shift;
+    my %scores = ();
+    foreach my $query (keys %{$rh_hits}) {
+        my %hit_already = (); # each assembly gets only a single score per query
+        foreach my $ra_h (@{$rh_hits->{$query}}) {
+            my $assembly = $rh_hits->{$query}->[0]->[0];
+            $scores{$assembly}++ unless ($hit_already{$assembly});
+            $hit_already{$assembly}++;
+        }
+    }
+    return \%scores;
+}
+
+sub get_hits {
+    my $file = shift;
+    my %hits = ();
+    open IN, $file or die "cannot open $file:$!";
+    while (my $line = <IN>) {
+        my @fields = split /\t/, $line;
+        if (!($hits{$fields[0]})
+                || ($hits{$fields[0]}->[0]->[1] == $fields[11])) {
+            $fields[11] =~ s/\s+//g;
+            $fields[1] =~ s/\.\d+$// or die "unexpected identifier:$fields[0]";
+            push @{$hits{$fields[0]}}, [$fields[1],$fields[11]];
+        }
+    }
+    return \%hits;
+}
+
+sub run_blast {
+    my $rh_opts = shift;
+    my ($fh,$tmpfile) = tempfile( DIR => $rh_opts->{'dir'} );
+    my $cmd  = "$rh_opts->{'blast'} -num_threads $rh_opts->{'threads'} -evalue $rh_opts->{'eval'} -query $rh_opts->{'query'} -db $rh_opts->{'blastdb'} ";
+    $cmd .= "-outfmt 6 -out $tmpfile 2>> $rh_opts->{'out'}.err";
+    add_cmd_to_file("$rh_opts->{'out'}.err",$cmd);
+    safe_system($cmd);
+    return $tmpfile;
+}
+
+sub make_blastdb {
+    my $rh_opts = shift;
+    my $fh      = '';
+    my $file    = '';
+
+    if ($rh_opts->{'saveblastdb'}) {
+        $file = $rh_opts->{'saveblastdb'};
+        $fh = IO::File->new(">$rh_opts->{'saveblastdb'}");
+    } else {
+        ($fh,$file) = tempfile( DIR => $rh_opts->{'dir'} );
+    }
+    $rh_opts->{'blastdb'} = $file;
+
+    my $count = 0;
+    foreach my $file (@{$rh_opts->{'assembly'}}) {
+        open IN, $file or die "cannot open $file:$!";
+        while (my $line = <IN>) {
+            if ($line =~ m/^>/) {
+                $count++;
+                print $fh ">$file.$count\n";
+            } else {
+                print $fh $line;
+            }
+        }
+    }
+    my $cmd = "$MAKEBLASTDB -in $file -dbtype nucl ";
+    $cmd .= ">> $rh_opts->{'out'}.err 2>> $rh_opts->{'out'}.err";
+    add_cmd_to_file("$rh_opts->{'out'}.err",$cmd);
+    safe_system($cmd);
+}
+
+sub add_cmd_to_file {
+    my $file = shift;
+    my $cmd = shift;
+    open OUT, ">>$file" or die "cannot open $file:$!";
+    print OUT "Running: $cmd\n";
+    close OUT;
+}
+
+sub safe_system {
+    my $cmd = shift;
+    warn "\$cmd = $cmd\n" unless ($QUIET);
+    my $error = system $cmd;
+    warn "system call failed:\n$cmd\nerror code=$?\n$!" if ($error != 0);
+}
+
+sub process_options {
+    my %opts = ('query' => '', 'assembly' => [], 'blast' => '', 'out' => '',
+                'eval' => $DEFAULT_EVAL, 'num_queries' => $DEFAULT_NUM_QUERIES,
+                'threads' => $DEFAULT_THREADS, 'randomseed' => '', 
+                'blastdb' => '', 'saveblastdb' => '', 'min_contig_size' => '');
+
+    my $opt_results = Getopt::Long::GetOptions('query=s' => \$opts{'query'},
+                                         'eval=f' => \$opts{'eval'},
+                                          'out=s' => \$opts{'out'},
+                                          'dir=s' => \$opts{'dir'},
+                                        'blast=s' => \$opts{'blast'},
+                                    'assembly=s@' => \$opts{'assembly'},
+                                  'num_queries=i' => \$opts{'num_queries'},
+                                      'blastdb=s' => \$opts{'blastdb'},
+                                  'saveblastdb=s' => \$opts{'saveblastdb'},
+                              'min_contig_size=i' => \$opts{'min_contig_size'},
+                                   'randomseed=i' => \$opts{'randomseed'},
+                                      'threads=i' => \$opts{'threads'},
+                                           'help' => \$opts{'help'},
+                                        'version' => \$opts{'version'},
+                                        );
+    _set_random_number_seed(\%opts);
+    $opts{'eval'} = $opts{'eval'} || $DEFAULT_EVAL;
+    $opts{'dir'} = tempdir(CLEANUP => 1) unless ($opts{'dir'});
+    die "$VERSION\n" if ($opts{'version'});
+    pod2usage({-exitval => 0, -verbose => 2}) if $opts{'help'};
+# need to work on this. should check blast =~ tblastn or tblastx
+# should check 2 assemblies are different files
+    usage() unless ($opts{'out'});
+    usage() unless ($opts{'query'});
+    usage() unless ($opts{'blast'});
+    usage() unless (scalar(@{$opts{'assembly'}}) >= 2);
+    return \%opts;
+}
+
+sub _set_random_number_seed {
+    my $rh_opts = shift;
+    if ($rh_opts->{'randomseed'}) {
+        srand($rh_opts->{'randomseed'});
+    } else {
+        $rh_opts->{'randomseed'} = srand();
+    }
+}
+
+sub usage {
+    die "usage: $0 --query=FASTA_FILE --blast=tblastn_OR_tblastx --out=PREFIX_FOR_OUTFILES --assembly=FASTA_ASSEMBLY1 --assembly=FASTA_ASSEMBLY2 [--assembly=ADDITIONAL_ASSEMBLY ...] [--num_queries=NUMBER_OF_QUERIES] [--eval=EVAL] [--threads=NUM_THREADS] [--blastdb=USE_EXISTING_BLASTDB] [--saveblastdb=PATH/FILE_TO_SAVE_GENERATED_BLASTDB] [--randomseed=RANDOMSEED_FOR_PICKING_QUERY_SEQS] [--min_contig_size=IGNORE_ASSEMBLED_SEQS_SHORTER_THAN_THIS] [--version] [--help]\n";
+}
+
+
+__END__
+
+=head1 NAME
+
+B<exoblaster> - BLAST query vs. a set of genome assemblies to eval assemblies
+
+=head1 AUTHOR
+
+Joseph F. Ryan <joseph.ryan@whitney.ufl.edu>
+
+=head1 SYNOPSIS
+
+=head1 OPTIONS
+
+=item B<--query=FASTA>
+
+A FASTA file with proteins or nucleotides usually from a species that is closely related. 
+
+=item B<--blast=BLAST_PROGRAM>
+
+Either tblastn or tblastx depending if your query is protein (tblastn) or nucleotide (tblastx). Running with tblastx will be much slower, but may be necessary if there are only transcriptome available, no predicted protein sequences.
+
+=item B<--out=PREFIX_FOR_OUTFILES>
+
+exoblast produces two files, PREFIX.exoblast and PREFIX.err. PREFIX.exoblast will have the rankings of hits, and PREFIX.err will have any errors that are reported during the process. The BLAST programs, especially makeblastdb tend to produce many warnings that will show up in the PREFIX.err file.
+
+=item B<--assembly=ASSEMBLY_FILE>
+
+Each assembly file is a FASTA file.  There should be at least 2 assembly options supplied (e.g., --assembly=ASSEMBLY1.fa --assembly=ASSEMBLY2.fa). Each assembly will be compared to each other in terms of EST hits to the query.  
+
+=item B<--num_queries=NUMBER_OF_SEQUENCES_TO_BLAST> [Default 5000]
+
+exoblast will randomly choose this number of queries from your FASTA
+file as queries to each of the assemblies.
+
+=item B<--eval>
+
+E-Value cutoff for the BLAST (default is 0.001)
+
+=item B<--threads=NUM_THREADS>
+
+Number of threads to use for BLAST searches
+
+=item B<--blastdb=USE_EXISTING_BLASTDB>
+
+Specify a BLAST database that was generated in a previous run of exoblast
+
+=item B<--saveblastdb=PATH/FILE_TO_SAVE_GENERATED_BLASTDB>
+
+Save the generated database for use in later runs of exoblast.
+For example, you may later want to increase the number of queries
+used in the analysis, or use a different set of queries.
+
+=item B<--randomseed=RANDOMSEED_FOR_PICKING_QUERY_SEQS>
+
+The picking of query sequences is done using a random set of numbers.
+Providing a seed allows for the analysis to be repeated.
+
+=item B<--min_contig_size=IGNORE_ASSEMBLED_SEQS_SHORTER_THAN_THIS>
+
+WARNING: Experimental option. Only considers contigs (or scaffolds)
+in the assemblies that are larger than the provided size
+
+=item B<--help>
+
+Print this manual
+
+=item B<--version>
+
+Print the version. Overrides all other options.
+
+=back
+
+=head1 DESCRIPTION
+
+=head1 COPYRIGHT
+
+Copyright (C) 2014, Joseph F. Ryan
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
+
