@@ -1,4 +1,6 @@
-<font color=red>NOTE: I recommend BUSCO over exoblast.</font>
+### This repository is not being actively maintained
+
+# NOTE: I recommend BUSCO(http://busco.ezlab.org/) over exoblast for assessing assemblies
 
 exoblast
 =======
