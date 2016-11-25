@@ -1,3 +1,5 @@
+<font color=red>NOTE: I recommend BUSCO over exoblast.</font>
+
 exoblast
 =======
 
